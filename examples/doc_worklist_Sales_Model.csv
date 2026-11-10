@@ -1,0 +1,19 @@
+Priority,Object Type,Table Name,Object Name,Needs,Expression Length,Current Description,Draft Description,Draft Comment,Approved,Lineage Tag
+0,Measure,_Measures,Total Sales,review description (expression changed),18,Sum,,,,lt-Total Sales
+1,Measure,_Measures,Param Measure,description,17,,,,,lt-Param Measure
+2,Calculated Column,Sales,Margin,description,19,,,,,lt-Margin
+3,Table,Sales,Sales,description,0,,,,,lt-Sales
+3,Table,Date,Date,description,0,,,,,lt-Date
+3,Table,Product,Product,description,0,,,,,lt-Product
+3,Table,Store,Store,description,0,,,,,lt-Store
+3,Table,_Measures,_Measures,description,0,,,,,lt-_Measures
+6,Column,Sales,Amount,description,0,,,,,lt-Amount
+6,Column,Sales,Notes,description,0,,,,,lt-Notes
+6,Column,Date,DateKey,description,0,,,,,lt-DateKey
+6,Column,Date,MonthName,description,0,,,,,lt-MonthName
+6,Column,Date,Fiscal Year,description,0,,,,,lt-Fiscal Year
+6,Column,Date,Fiscal Quarter,description,0,,,,,lt-Fiscal Quarter
+6,Column,Product,Name,description,0,,,,,lt-Name
+6,Column,Product,Color,description,0,,,,,lt-Color
+6,Column,Store,Name,description,0,,,,,lt-Name
+6,Column,Store,Address,description,0,,,,,lt-Address

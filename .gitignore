@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+dist/
 spark-warehouse/
 metastore_db/
 derby.log

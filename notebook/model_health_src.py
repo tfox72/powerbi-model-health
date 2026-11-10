@@ -1,26 +1,35 @@
 # %% [markdown]
-# # Model Health Check — Phase 1 (read-only)
+# # Power BI Model Health Check
 #
-# Scans the Power BI semantic models in a Fabric workspace and writes results to the attached lakehouse. Nothing in any model or report is changed.
+# **Version 0.6.0 · read-only.** Scans the Power BI semantic models in a Fabric workspace and tells you, in ranked order, what to fix. Nothing in any model or report is changed.
 #
-# **What it checks**
-# 1. **Best Practice Analyzer (BPA):** Microsoft's rule set for DAX, performance, error prevention, formatting and maintenance.
-# 2. **Star schema:** labels every table (fact, dimension, snowflaked, bridge, measure table, parameter…) and flags structural problems.
-# 3. **Unused objects:** columns and measures nothing uses. Checks the model's own dependencies plus every report bound to the model (PBIR and legacy format), using its own report parser.
-# 4. **Documentation:** missing descriptions and uncommented DAX/M. Also stores a fingerprint of each expression so later runs can spot changed measures whose descriptions may be out of date.
-# 5. **Size (Vertipaq):** the biggest columns, matched to the unused list to show likely savings.
+# ## How to use it
+# 1. **Attach a lakehouse** (Explorer pane → *Add lakehouse*). Results are saved there.
+# 2. In **Step 1**, set `DATASETS` to one small model for your first run.
+# 3. Select **Run all**. Step 4 checks your setup in a few seconds and stops with a plain message if something is missing.
+# 4. Read the results in **Step 7**, or give `Files/model_health/latest/summary.md` to your Copilot agent.
 #
-# **Prerequisites checklist**
-# - [ ] A lakehouse is attached to this notebook (e.g. `model_health`). Results go to its tables and to `Files/model_health/`.
-# - [ ] XMLA endpoints are enabled for the tenant and capacity (Read is enough for this phase; ask your Fabric admin).
-# - [ ] You have **Contributor** (or higher) on the model's workspace, or **Write** permission on each model. *Build* alone allows queries but not the full model metadata this notebook reads.
-# - [ ] You have **Contributor** (or higher) on the workspaces holding the reports, which is needed to read report definitions. Without it, those reports are listed as not scanned and confidence drops.
-# - [ ] **Ran an earlier version of this notebook?** Drop its `mh_` tables, or set `TABLE_PREFIX = "mh3_"`, because the table columns changed.
-# - [ ] The notebook runs on **Fabric Runtime 1.3** (Spark 3.5). The first code cell checks this.
-# - [ ] Semantic Link Labs **0.18.1** is available (see Step 0).
-# - [ ] *Optional:* **workspace monitoring** is enabled on the workspace if you want the query-log check (`MONITORING_DAYS`). It's the only way to see Excel / Analyze in Excel usage.
+# The only cell you edit is **Step 1**. Every other code cell has to run, but most have their code collapsed because you don't need to read it. Expand any cell to see what it does.
 #
-# **Read-only guarantee:** models are opened with `readonly=True`. BPA runs with `extended=False` and `export=False`. Report definitions are downloaded and parsed in memory, and nothing is saved back.
+# ## What it checks
+#
+# | Check | What you get |
+# |---|---|
+# | **Best practices** | Microsoft's Best Practice Analyzer rules for DAX, performance and error prevention, grouped and ranked, each with a short fix. |
+# | **Star schema** | A role for every table (fact, dimension, snowflaked, bridge, parameter…) and the structural problems worth fixing. |
+# | **Unused columns and measures** | What nothing uses, checked against the model's own dependencies and every report bound to it, with a confidence level that says how far to trust the list. |
+# | **Documentation** | Description and comment coverage, a data dictionary with full DAX and Power Query, a worklist for drafting what's missing, and which measures changed since the last run. |
+# | **Size** | The largest columns, matched to the unused list to show likely savings. |
+#
+# ## What you need
+# - **Fabric Runtime 1.3** (Spark 3.5). The first code cell checks this.
+# - **XMLA endpoints** enabled for the tenant and capacity (your Fabric admin can confirm).
+# - **Contributor** on the model's workspace, or **Write** on each model. *Build* alone can run queries but can't read the model metadata.
+# - **Contributor** on the workspaces that hold the reports. Reports you can't read are listed as not read, and confidence drops.
+# - *Optional:* **workspace monitoring** on the workspace, for the query-log check (`MONITORING_DAYS`). It's the only way to see Excel usage.
+#
+# ## Read-only guarantee
+# Models are opened with `readonly=True`. The Best Practice Analyzer runs with `extended=False` and `export=False`. Report definitions are downloaded and parsed in memory. Nothing is saved back to a model or report. The only things written are result files and tables in the lakehouse you attach.
 
 # %% [markdown]
 # ## Step 0 — Install Semantic Link Labs
@@ -40,7 +49,7 @@
 # The platform flags matter because one dependency (`psygnal`) has compiled wheels, and Fabric runs on Linux. Upload the `wheels` folder to the lakehouse at `Files/wheels`, then swap the `%pip` line for the commented offline line. `pyspark`, `ipywidgets`, `msal`, `requests` and `pandas` already come with Fabric Runtime 1.3. If the install still reports a missing package, download that one the same way and upload it.
 #
 # **Notes:**
-# - `%pip` restarts the Python interpreter, so keep it near the top. Only the quick runtime check runs before it.
+# - `%pip` restarts the Python interpreter, so it sits at the top. Only the quick runtime check runs before it.
 # - `%pip` isn't supported in High Concurrency sessions.
 # - In a Data Pipeline notebook activity, `%pip` only works if the activity sets the boolean parameter `_inlineInstallationEnabled = True`. Otherwise use option A.
 
@@ -62,6 +71,7 @@ print(f"Spark {pyspark.__version__}: OK")
 # %%
 import importlib.metadata
 
+NOTEBOOK_VERSION = "0.6.0"
 TESTED_VERSION = "0.18.1"
 try:
     _labs_version = importlib.metadata.version("semantic-link-labs")
@@ -75,24 +85,29 @@ if _labs_version != TESTED_VERSION:
     print(f"Note: tested with semantic-link-labs {TESTED_VERSION}; you have {_labs_version}. If a step fails, pin {TESTED_VERSION}.")
 
 import sempy_labs as labs
-print(f"semantic-link-labs {_labs_version} ready")
+print(f"Model Health {NOTEBOOK_VERSION} · semantic-link-labs {_labs_version} ready")
 
 # %% [markdown]
-# ## Step 1 — Parameters
-# This is the **parameters** cell, so pipelines and scheduled runs can override these values. Lists can also be passed as `"A,B"` or `'["A","B"]'`.
+# ## Step 1 — Settings
+# The only cell you normally edit. It's the **parameters** cell, so pipelines and scheduled runs can override any value. Lists can also be passed as `"A,B"` or `'["A","B"]'`.
 
 # %% [parameters]
-WORKSPACE = None            # None = the attached lakehouse's workspace (else the notebook's); or "Workspace Name"
-DATASETS = []               # [] = every semantic model in the workspace, or ["Model A", "Model B"]
+# --- What to scan ---
+WORKSPACE = None            # None = the attached lakehouse's workspace (else this notebook's); or "Workspace Name"
+DATASETS = []               # ["One Small Model"] for a first run; [] = every semantic model in the workspace
 SKIP_DATASETS = []          # model names to always skip
 
-RUN_BPA = True
-RUN_VERTIPAQ = True
-SCAN_REPORTS = True         # parse report definitions to find which fields reports use
-MONITORING_DAYS = 0         # >0: also check workspace monitoring query logs (Excel, ad-hoc DAX); max 30 (retention)
+# --- Which checks ---
+RUN_BPA = True              # Best Practice Analyzer
+RUN_VERTIPAQ = True         # column sizes
+SCAN_REPORTS = True         # read report definitions to find which fields reports use
+MONITORING_DAYS = 0         # >0: also check workspace monitoring query logs (Excel, ad-hoc DAX); 14-30 to count
 
-WRITE_TO_LAKEHOUSE = True   # append results to delta tables + write summary files to Files/model_health/
+# --- Where results go ---
+WRITE_TO_LAKEHOUSE = True   # False = show results in the notebook only (no files, no tables, no change tracking)
 TABLE_PREFIX = "mh_"
+
+# --- Tuning (rarely changed) ---
 TOP_N_COLUMNS = 50          # largest columns kept per model in mh_column_sizes
 TOP_FINDINGS_PER_MODEL = 50 # individual findings per model in top_findings.csv
 TOP_ISSUES_PER_MODEL = 12   # grouped issues per model in the summary files
@@ -100,12 +115,14 @@ LONG_EXPRESSION_CHARS = 300 # uncommented visible measures/calc columns at least
 SHORT_EXPRESSION_CHARS = 80 # uncommented expressions shorter than this are not flagged at all
 
 # %% [markdown]
-# ## Step 2 — Core logic
-# Pure functions with no Fabric calls, so each can be unit-tested on its own.
+# ## Step 2 — Engine: analysis logic
+# Function definitions only: nothing here talks to Fabric, so every function is unit-tested outside Fabric. The code is collapsed; expand a cell to read it.
 #
-# **Design rule:** when in doubt, the code treats an object as *used*. A missed cleanup costs nothing. A false "unused" can break a report if someone acts on it.
+# **Design rule:** when in doubt, an object counts as *used*. A missed cleanup costs nothing. A false "unused" can break a report if someone acts on it.
+#
+# ### 2a · Helpers and DAX parsing
 
-# %%
+# %% [engine]
 import re
 import json
 import hashlib
@@ -154,6 +171,40 @@ def as_bool(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "y")
+
+
+def select_models(all_models: list, datasets: list, skip: list) -> tuple:
+    """
+    Pick the models to scan from [{'name', 'id', 'is_default'}].
+    Names match case-insensitively. Default models (auto-created with a lakehouse or warehouse) are
+    scanned only when named in DATASETS. Returns (selected, names_not_found, default_models_left_out).
+    """
+    by_key = {}
+    for m in all_models:
+        by_key.setdefault(str(m["name"]).strip().casefold(), []).append(m)
+    skip_keys = {str(n).strip().casefold() for n in skip}
+    if datasets:
+        wanted = [str(n).strip() for n in datasets]
+        missing = sorted(n for n in wanted if n.casefold() not in by_key)
+        keys = {n.casefold() for n in wanted}
+        chosen = [m for m in all_models if str(m["name"]).strip().casefold() in keys]
+        left_out = []
+    else:
+        missing = []
+        chosen = [m for m in all_models if not m.get("is_default")]
+        left_out = [m["name"] for m in all_models if m.get("is_default")]
+    chosen = [m for m in chosen if str(m["name"]).strip().casefold() not in skip_keys]
+    return chosen, missing, left_out
+
+
+def duplicate_names(models: list) -> list:
+    """Model names that appear more than once (results are keyed by name, so duplicates would collide)."""
+    seen, dup = set(), []
+    for m in models:
+        if m["name"] in seen and m["name"] not in dup:
+            dup.append(m["name"])
+        seen.add(m["name"])
+    return dup
 
 
 # ---------- Expressions ----------
@@ -263,6 +314,10 @@ def finding(source, category, severity, object_type, table, name, text, suggesti
     }
 
 
+# %% [markdown]
+# ### 2b · Report parser
+
+# %% [engine]
 # ---------- Report parsing (PBIR and legacy report.json) ----------
 
 def _maybe_json(value):
@@ -344,6 +399,10 @@ def report_format(paths) -> str:
     return "PBIR" if any(p.startswith("definition/") for p in paths) else "PBIR-Legacy"
 
 
+# %% [markdown]
+# ### 2c · Star schema
+
+# %% [engine]
 # ---------- Star schema ----------
 
 def relationship_ends(rel: dict):
@@ -459,11 +518,11 @@ def star_schema_findings(classified: pd.DataFrame, relationships: pd.DataFrame) 
     return out
 
 
+# %% [markdown]
+# ### 2d · Unused objects and confidence
+
+# %% [engine]
 # ---------- Unused objects ----------
-
-_IGNORED_SOURCE_TYPES = ("HIERARCHY", "RELATIONSHIP", "PARTITION")  # matched as substrings
-_EXPRESSION_SOURCE_TYPES = {"MEASURE", "CALC_COLUMN", "CALC_TABLE"}
-
 
 def _dmv_node(obj_type, table, name):
     """Map a DMV object type to a graph node by substring, the way semantic-link-labs normalises usage types."""
@@ -480,9 +539,10 @@ def _dmv_node(obj_type, table, name):
 def build_dependency_edges(dmv: pd.DataFrame):
     """
     Turn DISCOVER_CALC_DEPENDENCY rows into graph edges.
-    - Measures (incl. their format-string / detail-rows expressions), calculated columns, calculated tables
-      and partitions become edges: their dependencies are used only if the object itself is used.
-    - Hierarchy and relationship rows are ignored (attribute hierarchies reference every column).
+    - Measures, calculated columns, calculated tables, partitions and plain columns or tables become
+      edges: their dependencies are used only if the object itself is used.
+    - Hierarchy and relationship rows are ignored (attribute hierarchies reference every column;
+      relationship columns are added as roots from the model metadata).
     - Everything else (RLS, calculation items, KPIs, unknown types) becomes a root: always in use.
     Returns (edges, roots, notes) where notes lists the source types seen and any unmapped referenced types.
     """
@@ -493,13 +553,13 @@ def build_dependency_edges(dmv: pd.DataFrame):
         ref_type = r.get("Referenced Object Type")
         target = _dmv_node(ref_type, r.get("Referenced Table"), r.get("Referenced Object"))
         if target is None:
-            unmapped.add(str(ref_type).upper())
+            unmapped.add(_k(ref_type).upper())
             continue
-        if any(x in src_type for x in ("HIERARCHY", "RELATIONSHIP")) or src_type in ("COLUMN", "TABLE"):
+        if "HIERARCHY" in src_type or "RELATIONSHIP" in src_type:
             continue
-        is_expression = ("MEASURE" in src_type or "PARTITION" in src_type
-                         or ("CALC" in src_type and ("COLUMN" in src_type or "TABLE" in src_type)))
-        src = _dmv_node(src_type, r.get("Table Name"), r.get("Object Name")) if is_expression else None
+        follows = ("MEASURE" in src_type or "PARTITION" in src_type or src_type in ("COLUMN", "TABLE")
+                   or ("CALC" in src_type and ("COLUMN" in src_type or "TABLE" in src_type)))
+        src = _dmv_node(src_type, r.get("Table Name"), r.get("Object Name")) if follows else None
         if src is not None:
             if src != target:
                 edges.setdefault(src, set()).add(target)
@@ -608,6 +668,27 @@ def usage_confidence(scan_enabled: bool, scan_failed: bool, reports_total: int, 
     return level, detail + blind
 
 
+def judge_query_logs(coverage: dict, days: int, reports_total: int, now=None) -> tuple:
+    """
+    ('ok', text) only if the logs can really vouch for the window; otherwise ('partial', reason).
+    The library caps its query fetch at 50,000 rows, so a busier model can't be fully scored.
+    """
+    now = now or pd.Timestamp.now(tz="UTC")
+    q, xl, first = coverage.get("queries", 0), coverage.get("excel", 0), coverage.get("first")
+    if days < 14:
+        return "partial", f"only {days} days of query logs requested (14+ needed to rely on them)"
+    if first is None:
+        return "partial", "no workspace monitoring data found for the window"
+    covered = (now - first).days
+    if covered < 0.9 * days:
+        return "partial", f"monitoring data only goes back {covered} days of the {days} requested"
+    if q >= 50000:
+        return "partial", f"{q:,} queries in the window; the library scores at most 50,000, so usage may be missed"
+    if reports_total > 0 and q == 0:
+        return "partial", "no queries logged for this model even though reports exist (renamed model, or logs not capturing)"
+    return "ok", f"query logs for {days} days checked ({q:,} queries, {xl:,} from Excel)"
+
+
 def unused_objects(columns: pd.DataFrame, measures: pd.DataFrame, used: set, excluded_tables: set,
                    confidence_level: str, column_sizes: dict | None = None, direct_lake: bool = False,
                    edges: dict | None = None, query_log_days: int = 0) -> pd.DataFrame:
@@ -668,6 +749,10 @@ def unused_objects(columns: pd.DataFrame, measures: pd.DataFrame, used: set, exc
     return df.sort_values(["Size Bytes", "Object Type"], ascending=[False, True]).reset_index(drop=True)
 
 
+# %% [markdown]
+# ### 2e · Documentation and change tracking
+
+# %% [engine]
 # ---------- Documentation ----------
 
 def documentation_rows(tables, columns, measures, expressions, skip_tables: set, long_chars: int,
@@ -684,6 +769,7 @@ def documentation_rows(tables, columns, measures, expressions, skip_tables: set,
             "Has Description": has_desc, "Has Expression": has_expr, "Has Comment": has_cmt,
             "Expression Length": len(expression or ""), "Expression Hash": expression_hash(expression),
             "Lineage Tag": lineage or "", "Description": description or "",
+            "Is Generated": table in skip_tables,   # auto-date and field-parameter tables: inventoried, never flagged
         })
         if table in skip_tables or (obj_type == "Shared M Expression" and name == "DatabaseQuery"):
             return
@@ -719,6 +805,49 @@ def documentation_rows(tables, columns, measures, expressions, skip_tables: set,
         add(e["Object Type"], e["Table Name"], e["Object Name"], e.get("Description", ""), e["Expression"],
             e["Language"], True, e.get("Lineage Tag"))
     return pd.DataFrame(inv), out
+
+
+WORKLIST_COLUMNS = ["Priority", "Object Type", "Table Name", "Object Name", "Needs", "Expression Length",
+                    "Current Description", "Draft Description", "Draft Comment", "Approved", "Lineage Tag"]
+_WORKLIST_ORDER = {"Measure": 1, "Calculated Column": 2, "Table": 3, "Calculation Item": 4, "Calculated Table": 4,
+                   "M Partition": 5, "Shared M Expression": 5, "Column": 6}
+
+
+def doc_worklist(findings: pd.DataFrame, inventory: pd.DataFrame, changes: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    One row per object that needs documentation, ready for drafts to be filled in:
+    objects whose expression changed but whose description didn't come first, then measures,
+    calculated columns, tables, other expressions and columns. The Draft and Approved columns
+    are left blank for the agent and the model owner. Lineage Tag identifies the object even if renamed.
+    """
+    needs, stale = {}, set()
+    if findings is not None and len(findings):
+        for r in findings[findings["Source"] == "Documentation"].to_dict("records"):
+            key = (r["Object Type"], r["Table Name"], r["Object Name"])
+            needs.setdefault(key, set()).add("description" if r["Category"] == "Descriptions" else "comment")
+    if changes is not None and len(changes):
+        for r in changes[changes["Description_May_Be_Stale"].astype(bool)].to_dict("records"):
+            key = (r["Object_Type"], r["Table_Name"], r["Object_Name"])
+            stale.add(key)
+            needs.setdefault(key, set())
+    inv = {}
+    if inventory is not None and len(inventory):
+        inv = {(r["Object Type"], r["Table Name"], r["Object Name"]): r for r in inventory.to_dict("records")}
+    rows = []
+    for key, what in needs.items():
+        item = inv.get(key, {})
+        parts = (["review description (expression changed)"] if key in stale else []) + \
+                [w for w in ("description", "comment") if w in what]
+        rows.append({
+            "Priority": 0 if key in stale else _WORKLIST_ORDER.get(key[0], 7),
+            "Object Type": key[0], "Table Name": key[1], "Object Name": key[2], "Needs": " + ".join(parts),
+            "Expression Length": int(item.get("Expression Length", 0) or 0),
+            "Current Description": item.get("Description", "") or "",
+            "Draft Description": "", "Draft Comment": "", "Approved": "",
+            "Lineage Tag": item.get("Lineage Tag", "") or "",
+        })
+    df = pd.DataFrame(rows, columns=WORKLIST_COLUMNS)
+    return df.sort_values(["Priority", "Expression Length"], ascending=[True, False], kind="stable").reset_index(drop=True)
 
 
 def compute_changes(previous: pd.DataFrame, current: pd.DataFrame) -> pd.DataFrame:
@@ -765,28 +894,12 @@ def compute_changes(previous: pd.DataFrame, current: pd.DataFrame) -> pd.DataFra
     return pd.DataFrame(rows, columns=cols)
 
 
-def judge_query_logs(coverage: dict, days: int, reports_total: int, now=None) -> tuple:
-    """
-    ('ok', text) only if the logs can really vouch for the window; otherwise ('partial', reason).
-    The library caps its query fetch at 50,000 rows, so a busier model can't be fully scored.
-    """
-    now = now or pd.Timestamp.now(tz="UTC")
-    q, xl, first = coverage.get("queries", 0), coverage.get("excel", 0), coverage.get("first")
-    if days < 14:
-        return "partial", f"only {days} days of query logs requested (14+ needed to rely on them)"
-    if first is None:
-        return "partial", "no workspace monitoring data found for the window"
-    covered = (now - first).days
-    if covered < 0.9 * days:
-        return "partial", f"monitoring data only goes back {covered} days of the {days} requested"
-    if q >= 50000:
-        return "partial", f"{q:,} queries in the window; the library scores at most 50,000, so usage may be missed"
-    if reports_total > 0 and q == 0:
-        return "partial", "no queries logged for this model even though reports exist (renamed model, or logs not capturing)"
-    return "ok", f"query logs for {days} days checked ({q:,} queries, {xl:,} from Excel)"
 
 
+# %% [markdown]
+# ### 2f · Ranking, summaries and data dictionary
 
+# %% [engine]
 # ---------- Agent-ready summary ----------
 
 _AREA_RANK = {  # lower = more important, applied within the same severity
@@ -931,6 +1044,15 @@ def group_issues(findings: pd.DataFrame, unused: pd.DataFrame | None = None, con
     return out[cols].reset_index(drop=True)
 
 
+def show_markdown(text: str) -> None:
+    """Render markdown in the notebook output. Front ends without rich output show the same text as plain text."""
+    try:
+        from IPython.display import display as _ipython_display
+        _ipython_display({"text/markdown": text, "text/plain": text}, raw=True)
+    except Exception:
+        print(text)
+
+
 def _md_cell(value) -> str:
     text = (str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
             .replace("|", "\\|").replace("`", "'")).strip()
@@ -965,7 +1087,8 @@ def model_summary_markdown(model: str, status: str, score: dict, issues: pd.Data
                            unscanned: pd.DataFrame, unused: pd.DataFrame, roles: pd.DataFrame,
                            doc: pd.DataFrame, changes: pd.DataFrame, issue_limit: int = 12,
                            has_previous: bool = False, dictionary_file: str = "", sizes_available: bool = True,
-                           short_chars: int = 80, relationships: pd.DataFrame | None = None) -> str:
+                           short_chars: int = 80, relationships: pd.DataFrame | None = None,
+                           worklist_file: str = "", worklist_count: int = 0) -> str:
     """One model's section: everything SKILL.md asks the agent to report, already ranked and capped."""
     md = [f"## {model}", "", f"**Status:** {status}", ""]
     shown = [f"{k}: {v}" for k, v in (score or {}).items() if k not in ("Dataset Name", "Status") and v not in (None, "")]
@@ -991,7 +1114,8 @@ def model_summary_markdown(model: str, status: str, score: dict, issues: pd.Data
                        "logs for 2–4 weeks → back up the model → remove. \"After:\" means remove those objects first."]
             u["Size MB"] = [("" if t == "Measure" else "n/a" if (note or not sizes_available) else f"{b / 1_048_576:.1f}")
                             for t, b, note in zip(u["Object Type"], u["Size Bytes"], u["Size Note"])]
-            md.append(_md_table(u, ["Object Type", "Table Name", "Object Name", "Is Hidden", "Size MB", "Recommendation"],
+            u["Visibility"] = u["Is Hidden"].astype(bool).map({True: "hidden", False: "visible"})
+            md.append(_md_table(u, ["Object Type", "Table Name", "Object Name", "Visibility", "Size MB", "Recommendation"],
                                 15, "unused_candidates.csv"))
         else:
             md += ["", "_No unused objects found._", ""]
@@ -1014,6 +1138,9 @@ def model_summary_markdown(model: str, status: str, score: dict, issues: pd.Data
 
     md.append("### Documentation")
     if doc is not None and len(doc):
+        if "Is Generated" in doc.columns:          # coverage counts the same objects the findings do
+            doc = doc[~doc["Is Generated"].astype(bool)]
+
         def cov(otype, visible_only=False):
             d = doc[doc["Object Type"] == otype]
             if visible_only:
@@ -1029,9 +1156,11 @@ def model_summary_markdown(model: str, status: str, score: dict, issues: pd.Data
             gaps["Needs"] = [" + ".join(x for x, need in (("description", not d), ("comment", (not c) and n >= short_chars)) if need)
                              for d, c, n in zip(gaps["Has Description"], gaps["Has Comment"], gaps["Expression Length"])]
             md += ["", "Visible measures needing documentation (longest first):",
-                   _md_table(gaps, ["Object Name", "Table Name", "Expression Length", "Needs"], 10, "dictionary file")]
+                   _md_table(gaps, ["Object Name", "Table Name", "Expression Length", "Needs"], 10, "worklist file")]
         else:
             md.append("")
+        if worklist_file and worklist_count:
+            md += [f"Worklist for drafting descriptions and comments: `{worklist_file}` ({worklist_count} objects).", ""]
     else:
         md += ["", "_Not available._", ""]
 
@@ -1063,8 +1192,8 @@ def model_summary_markdown(model: str, status: str, score: dict, issues: pd.Data
 def workspace_summary_markdown(meta: dict, scorecard: pd.DataFrame, model_sections: dict, failures: pd.DataFrame,
                                detail_models: int = 3) -> str:
     md = [f"# Model health summary — {meta['workspace']}",
-          f"Run `{meta['run_id']}` · {meta['run_ts']:%Y-%m-%d %H:%M} UTC · semantic-link-labs {meta['labs_version']} · "
-          f"{len(scorecard)} model(s)\n"]
+          f"Run `{meta['run_id']}` · {meta['run_ts']:%Y-%m-%d %H:%M} UTC · Model Health {meta.get('notebook_version', '')} · "
+          f"semantic-link-labs {meta['labs_version']} · {len(scorecard)} model(s)\n"]
     if scorecard is None or scorecard.empty:
         md.append("**No models were analyzed.** Check the DATASETS parameter and the failed steps below.\n")
     else:
@@ -1175,10 +1304,12 @@ def dictionary_markdown(model: str, tables: pd.DataFrame, roles: dict, columns: 
     return "\n".join(md)
 
 # %% [markdown]
-# ## Step 3 — Fabric readers
-# Every call here only reads.
+# ## Step 3 — Engine: Fabric readers
+# Function definitions that read from Fabric. Every call opens models and reports read-only. Nothing runs until Step 4.
+#
+# ### 3a · Readers
 
-# %%
+# %% [engine]
 import os
 import time
 import base64
@@ -1190,21 +1321,7 @@ from sempy_labs.report import get_report_definition
 from sempy_labs._helper_functions import format_dax_object_name, get_downstream_relations
 import sempy_labs._icons as icons
 
-# Pipelines pass parameters as strings: normalise them.
-WORKSPACE = (str(WORKSPACE).strip() or None) if WORKSPACE is not None else None
-DATASETS = as_list(DATASETS)
-SKIP_DATASETS = as_list(SKIP_DATASETS)
-RUN_BPA, RUN_VERTIPAQ, SCAN_REPORTS, WRITE_TO_LAKEHOUSE = map(as_bool, (RUN_BPA, RUN_VERTIPAQ, SCAN_REPORTS, WRITE_TO_LAKEHOUSE))
-TOP_N_COLUMNS, TOP_FINDINGS_PER_MODEL, TOP_ISSUES_PER_MODEL, LONG_EXPRESSION_CHARS, SHORT_EXPRESSION_CHARS = map(
-    int, (TOP_N_COLUMNS, TOP_FINDINGS_PER_MODEL, TOP_ISSUES_PER_MODEL, LONG_EXPRESSION_CHARS, SHORT_EXPRESSION_CHARS))
-MONITORING_DAYS = max(0, min(30, int(MONITORING_DAYS or 0)))
-TABLE_PREFIX = str(TABLE_PREFIX)
-
-RUN_ID = str(uuid.uuid4())
-RUN_TS = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-WORKSPACE_ID = fabric.resolve_workspace_id(WORKSPACE)
-WORKSPACE_NAME = fabric.resolve_workspace_name(WORKSPACE_ID)
-
+FILES_ROOT = "/lakehouse/default/Files"   # where Fabric mounts the notebook's default lakehouse
 
 TABLE_COLUMNS = ["Table Name", "Is Hidden", "Description", "Lineage Tag", "Data Columns", "Visible Columns", "Measures",
                  "Is Calc Group", "Is Field Parameter", "Is Auto Date", "Is Agg Table", "Is Date Table", "Is Calc Table",
@@ -1216,7 +1333,10 @@ MEASURE_COLUMNS = ["Table Name", "Measure Name", "Expression", "Description", "I
 
 
 def list_models(workspace) -> list:
-    """[{'name', 'id'}] for semantic models in the workspace, skipping lakehouse/warehouse default models."""
+    """
+    Every semantic model in the workspace as [{'name', 'id', 'is_default'}].
+    is_default marks the models Fabric creates automatically for a lakehouse or warehouse (same name as the item).
+    """
     dfD = fabric.list_datasets(workspace=workspace, mode="rest")
     try:
         items = fabric.list_items(workspace=workspace)
@@ -1227,16 +1347,8 @@ def list_models(workspace) -> list:
         )
     except Exception:
         defaults = set()
-    models = [{"name": r["Dataset Name"], "id": str(r["Dataset Id"])} for r in dfD.to_dict("records")]
-    if DATASETS:
-        missing = set(DATASETS) - {m["name"] for m in models}
-        if missing:
-            print(f"Not found in {WORKSPACE_NAME}: {sorted(missing)}")
-        models = [m for m in models if m["name"] in DATASETS]
-    skipped = [m["name"] for m in models if m["name"] in defaults]
-    if skipped:
-        print(f"Skipping default (lakehouse/warehouse) models: {skipped}. Add them to DATASETS explicitly to include.")
-    return [m for m in models if (m["name"] not in defaults or m["name"] in DATASETS) and m["name"] not in SKIP_DATASETS]
+    return [{"name": r["Dataset Name"], "id": str(r["Dataset Id"]), "is_default": r["Dataset Name"] in defaults}
+            for r in dfD.to_dict("records")]
 
 
 def read_model_metadata(dataset, workspace) -> dict:
@@ -1447,10 +1559,11 @@ def read_report_fields(report_id, workspace_id):
     return report_format([p for p, _ in docs]), nodes, problems
 
 
-def read_previous_docs(table_name, workspace_id, dataset_ids) -> pd.DataFrame:
+def read_previous_docs(table_name, workspace_id, dataset_ids, exclude_run_id=None) -> pd.DataFrame:
     """
     Latest earlier snapshot of mh_documentation for the given models, filtered in Spark so history size
-    doesn't matter. Returns an empty frame on the first run (table missing).
+    doesn't matter. Returns an empty frame on the first run (table missing). The current run is excluded,
+    so re-running a cell after saving never compares a run with itself.
     """
     from pyspark.sql import functions as F
     name = next((n for n in (table_name, f"dbo.{table_name}") if spark.catalog.tableExists(n)), None)
@@ -1464,6 +1577,8 @@ def read_previous_docs(table_name, workspace_id, dataset_ids) -> pd.DataFrame:
         print(f"   {table_name} is from an older notebook version (missing {missing}); change tracking starts now.")
         return pd.DataFrame()
     t = t.where((F.col("Workspace_Id") == str(workspace_id)) & F.col("Dataset_Id").isin([str(d) for d in dataset_ids]))
+    if exclude_run_id and "Run_Id" in t.columns:
+        t = t.where(F.col("Run_Id") != str(exclude_run_id))
     latest = t.groupBy("Dataset_Id").agg(F.max("Run_Timestamp").alias("_mx"))
     t = t.join(latest, on="Dataset_Id").where(F.col("Run_Timestamp") == F.col("_mx")).select(*needed)
     return t.toPandas()
@@ -1531,9 +1646,9 @@ def read_column_sizes(dataset, workspace) -> pd.DataFrame:
     return cols[keep].copy()
 
 # %% [markdown]
-# ## Step 4 — Analyze each model
+# ### 3b · Analyze one model
 
-# %%
+# %% [engine]
 def _bpa_table(object_name: str) -> str:
     m = re.match(r"^'((?:[^']|'')+)'\[", str(object_name))
     return m.group(1).replace("''", "'") if m else ""
@@ -1701,11 +1816,99 @@ def analyze_model(model, workspace) -> dict:
     return out
 
 # %% [markdown]
-# ## Step 5 — Run
+# ## Step 4 — Preflight
+# Checks the setup before the scan starts, so a missing lakehouse, a mistyped model name or a permission gap shows up in seconds with a plain message.
+
+# %% [engine]
+# Pipelines pass parameters as strings: normalise them.
+WORKSPACE = (str(WORKSPACE).strip() or None) if WORKSPACE is not None else None
+DATASETS = as_list(DATASETS)
+SKIP_DATASETS = as_list(SKIP_DATASETS)
+RUN_BPA, RUN_VERTIPAQ, SCAN_REPORTS, WRITE_TO_LAKEHOUSE = map(as_bool, (RUN_BPA, RUN_VERTIPAQ, SCAN_REPORTS, WRITE_TO_LAKEHOUSE))
+TOP_N_COLUMNS, TOP_FINDINGS_PER_MODEL, TOP_ISSUES_PER_MODEL, LONG_EXPRESSION_CHARS, SHORT_EXPRESSION_CHARS = map(
+    int, (TOP_N_COLUMNS, TOP_FINDINGS_PER_MODEL, TOP_ISSUES_PER_MODEL, LONG_EXPRESSION_CHARS, SHORT_EXPRESSION_CHARS))
+MONITORING_DAYS = max(0, min(30, int(MONITORING_DAYS or 0)))
+TABLE_PREFIX = str(TABLE_PREFIX)
+
+
+def _preflight(ok: bool, label: str, detail: str = "") -> None:
+    print(("  [ok]   " if ok else "  [warn] ") + label + (f": {detail}" if detail else ""))
+
+
+print("Preflight")
+
+# 1. Lakehouse (needed for files, tables and change tracking)
+HAS_LAKEHOUSE = os.path.isdir(FILES_ROOT)
+if WRITE_TO_LAKEHOUSE and not HAS_LAKEHOUSE:
+    raise RuntimeError(
+        "No lakehouse is attached to this notebook, so results can't be saved. "
+        "Attach one in the Explorer pane (Add lakehouse) and run again, "
+        "or set WRITE_TO_LAKEHOUSE = False in Step 1 to see results in the notebook only."
+    )
+_preflight(HAS_LAKEHOUSE or not WRITE_TO_LAKEHOUSE,
+           "Lakehouse attached" if HAS_LAKEHOUSE else "No lakehouse: results will only show in this notebook")
+
+# 2. Workspace
+try:
+    WORKSPACE_ID = fabric.resolve_workspace_id(WORKSPACE)
+    WORKSPACE_NAME = fabric.resolve_workspace_name(WORKSPACE_ID)
+except Exception as ex:
+    raise RuntimeError(
+        f"The workspace {WORKSPACE!r} could not be opened ({type(ex).__name__}: {str(ex)[:200]}). "
+        "Check the WORKSPACE name in Step 1 and that you are a member of it."
+    ) from ex
+_preflight(True, f"Workspace '{WORKSPACE_NAME}'",
+           "" if WORKSPACE else "chosen by default (the attached lakehouse's workspace, else this notebook's); "
+                                "set WORKSPACE in Step 1 to scan a different one")
+
+# 3. Models
+ALL_MODELS = list_models(WORKSPACE_ID)
+models, _missing, _left_out = select_models(ALL_MODELS, DATASETS, SKIP_DATASETS)
+_available = ", ".join(sorted(m["name"] for m in ALL_MODELS)[:40]) or "(none)"
+if not ALL_MODELS:
+    raise ValueError(f"No semantic models were found in workspace '{WORKSPACE_NAME}'. "
+                     "Set WORKSPACE in Step 1 to the workspace that holds the models.")
+if not models:
+    raise ValueError(
+        f"Nothing to scan in workspace '{WORKSPACE_NAME}'. "
+        + (f"Not found: {_missing}. " if _missing else "")
+        + f"Models in this workspace: {_available}. Fix DATASETS / SKIP_DATASETS in Step 1."
+    )
+if _missing:
+    _preflight(False, f"Not found in '{WORKSPACE_NAME}' and skipped", f"{_missing}. Available: {_available}")
+if _left_out:
+    _preflight(True, "Default lakehouse/warehouse models left out", f"{_left_out}. Name them in DATASETS to include them")
+for _name in duplicate_names(models):
+    _preflight(False, f"Two models are named '{_name}'", "results are kept per name, so only one will be reported. Rename one, or scan them in separate runs")
+_preflight(True, f"{len(models)} model(s) to scan", ", ".join(m["name"] for m in models[:15]) + (" …" if len(models) > 15 else ""))
+if len(models) > 10 and not DATASETS:
+    _preflight(False, "Large scope", "DATASETS is empty, so every model is scanned. For a first run, name one small model in Step 1")
+
+# 4. Can the first model's metadata be opened? (XMLA + Contributor/Write). A warning only: the scan tries every model.
+try:
+    with connect_semantic_model(dataset=models[0]["name"], workspace=WORKSPACE_ID, readonly=True) as _tom:
+        _table_count = _tom.model.Tables.Count
+    _preflight(True, f"Model metadata readable ('{models[0]['name']}', {_table_count} tables)")
+except Exception as ex:
+    _preflight(False, f"Could not open '{models[0]['name']}'",
+               f"{type(ex).__name__}: {str(ex)[:200]}. Usual causes: XMLA endpoints are off for the tenant or capacity, "
+               "or you have Build but not Contributor (or Write) on the model. The scan will still try each model")
+
+# 5. Options
+if MONITORING_DAYS and MONITORING_DAYS < 14:
+    _preflight(False, f"MONITORING_DAYS = {MONITORING_DAYS}", "query logs are read, but fewer than 14 days can't raise confidence")
+_preflight(True, "Checks", ", ".join(n for n, on in (("best practices", RUN_BPA), ("column sizes", RUN_VERTIPAQ),
+                                                      ("report usage", SCAN_REPORTS), ("query logs", MONITORING_DAYS > 0)) if on))
+print("Preflight passed.")
+
+# %% [markdown]
+# ## Step 5 — Scan
+# Analyzes each model in turn. A step that fails for one model is recorded and the scan carries on. Each run of this cell is a new run with its own Run Id.
 
 # %%
-models = list_models(WORKSPACE_ID)
-print(f"Workspace: {WORKSPACE_NAME} | models to scan: {len(models)} | run id: {RUN_ID}")
+RUN_ID = str(uuid.uuid4())
+RUN_TS = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+print(f"Run {RUN_ID} · workspace '{WORKSPACE_NAME}' · {len(models)} model(s)")
 
 results = {}
 for i, model in enumerate(models, 1):
@@ -1716,12 +1919,16 @@ for i, model in enumerate(models, 1):
     except Exception:
         results[model["name"]] = {"findings": [], "log": [{"Step": "Analyze model", "Status": "Failed", "Seconds": 0.0,
                                                            "Error": traceback.format_exc()[-800:]}]}
-    print(f"   done in {time.time() - t0:.0f}s, {len(results[model['name']]['findings'])} findings")
+    _failed = [l["Step"] for l in results[model["name"]]["log"] if l["Status"] == "Failed"]
+    print(f"   {time.time() - t0:.0f}s · {len(results[model['name']]['findings'])} findings"
+          + (f" · failed steps: {', '.join(_failed)}" if _failed else ""))
+print("Scan finished.")
 
 # %% [markdown]
-# ## Step 6 — Combine, compare with the previous run, rank
+# ## Step 6 — Engine: combine, compare with the previous run, rank
+# Turns the scan results into the scorecard, the grouped issues, the summaries, the data dictionaries and the documentation worklists. Nothing is saved yet.
 
-# %%
+# %% [engine]
 MODEL_IDS = {m["name"]: m["id"] for m in models}
 
 
@@ -1758,8 +1965,8 @@ def to_delta_safe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [delta_name(c) for c in df.columns]
     for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = df[c].map(lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v))
+        if df[c].dtype == object or pd.api.types.is_string_dtype(df[c].dtype):   # object in pandas 2, str in pandas 3
+            df[c] = df[c].map(lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)).astype(object)
     return df
 
 
@@ -1784,7 +1991,8 @@ outputs["changes"] = pd.DataFrame()
 PREVIOUS_FOUND = set()
 if "spark" in globals() and not outputs["documentation"].empty:
     try:
-        prev_all = read_previous_docs(f"{TABLE_PREFIX}documentation", WORKSPACE_ID, list(MODEL_IDS.values()))
+        prev_all = read_previous_docs(f"{TABLE_PREFIX}documentation", WORKSPACE_ID, list(MODEL_IDS.values()),
+                                      exclude_run_id=RUN_ID)
         cur_all = to_delta_safe(outputs["documentation"])
         frames = []
         for ds, ds_id in MODEL_IDS.items():
@@ -1812,7 +2020,7 @@ f, doc, conf, log = (outputs[k] for k in ("findings", "documentation", "usage_co
 failures = log[log["Status"] == "Failed"] if not log.empty else pd.DataFrame(columns=["Dataset Name", "Step", "Error"])
 FILE_STEMS = unique_file_names(models)
 KEY_EXCLUDED = {"Formatting", "Naming Conventions"}
-score_rows, issue_frames, sections, dictionaries = [], [], {}, {}
+score_rows, issue_frames, sections, dictionaries, worklists = [], [], {}, {}, {}
 for ds in results:
     try:
         fm = by_model(failures, ds)
@@ -1852,14 +2060,19 @@ for ds in results:
             issue_frames.append(issues.assign(**{"Dataset Name": ds}))
         rs = by_model(outputs["report_scan"], ds)
         meta_ = results[ds].get("meta")
-        dict_file = f"dictionary_{FILE_STEMS.get(ds, safe_name(ds))}.md" if meta_ else ""
+        stem_ = FILE_STEMS.get(ds, safe_name(ds))
+        dict_file = f"dictionary_{stem_}.md" if meta_ else ""
+        wl = doc_worklist(fd, dd, by_model(outputs["changes"], ds))
+        if len(wl):
+            worklists[ds] = wl
         sections[ds] = model_summary_markdown(
             ds, status, score, issues, cd.iloc[0].to_dict() if len(cd) else {},
             rs[~rs["Scanned"].astype(bool)] if len(rs) else rs, ud, by_model(outputs["star_schema_tables"], ds),
             dd, by_model(outputs["changes"], ds), TOP_ISSUES_PER_MODEL,
             has_previous=ds in PREVIOUS_FOUND, dictionary_file=dict_file,
             sizes_available="column_sizes" in results[ds], short_chars=SHORT_EXPRESSION_CHARS,
-            relationships=meta_["relationships"] if meta_ else None)
+            relationships=meta_["relationships"] if meta_ else None,
+            worklist_file=f"doc_worklist_{stem_}.csv", worklist_count=len(wl))
         if not bpa_ran and not failed_model:
             sections[ds] = sections[ds].replace("**Status:** OK", "**Status:** OK (BPA not run, so Errors is blank)", 1)
         if meta_:
@@ -1886,94 +2099,107 @@ if len(top_findings):
     top_findings = top_findings.assign(Fix=[_short_fix(r, d) if src == "BPA" else d for src, r, d in
                                             zip(top_findings["Source"], top_findings["Finding"], top_findings["Suggestion"])])
 summary = workspace_summary_markdown(
-    {"workspace": WORKSPACE_NAME, "run_id": RUN_ID, "run_ts": RUN_TS, "labs_version": _labs_version},
+    {"workspace": WORKSPACE_NAME, "run_id": RUN_ID, "run_ts": RUN_TS, "labs_version": _labs_version,
+     "notebook_version": NOTEBOOK_VERSION},
     scorecard, sections, failures)
 
-display(scorecard)
-if len(top_issues):
-    display(top_issues.groupby("Dataset Name").head(8))
-if len(failures):
-    print("Some steps failed — details in mh_run_log:")
-    display(failures[["Dataset Name", "Step", "Error"]])
-
 # %% [markdown]
-# ## Step 7 — Save
-# Summary files are written **first**, so a table-write problem can't stop them. **Upload `Files/model_health/latest/summary.md` to your Copilot agent.** For one model in depth, also upload `summary_<model>.md` and `dictionary_<model>.md`.
+# ## Step 7 — Results
+# The same summary your agent gets: the scorecard for every model, then the ranked issues, unused objects, model shape and documentation gaps for up to three models. With more than three, the two with the most errors and key warnings are shown, and every model has its own `summary_<model>.md` in the lakehouse.
 
 # %%
+show_markdown(summary)
+
+# %% [markdown]
+# ## Step 8 — Save
+# Writes the files to `Files/model_health/latest/` (plus a dated copy under `runs/`), then appends the delta tables. Files go first, so a table problem can't stop them. Running this cell twice for the same run saves nothing twice.
+
+# %% [engine]
 UNUSED_COLS = ["Dataset Name", "Object Type", "Table Name", "Object Name", "Is Hidden", "Size Bytes", "Size Note",
                "Used Only By Unused", "Confidence", "Recommendation"]
-written_files = []
-if WRITE_TO_LAKEHOUSE:
-    files_root = "/lakehouse/default/Files"
-    if os.path.isdir(files_root):
+if "_SAVED" not in globals():
+    _SAVED = set()   # (run id, what) pairs already written in this session
+
+if not WRITE_TO_LAKEHOUSE:
+    print("WRITE_TO_LAKEHOUSE is False, so nothing was saved. The results are in Step 7.")
+else:
+    if not os.path.isdir(FILES_ROOT):
+        print("No default lakehouse is mounted, so the summary files were skipped.")
+    elif (RUN_ID, "files") in _SAVED:
+        print(f"Files for run {RUN_ID[:8]} are already saved.")
+    else:
         stamp = f"{RUN_TS:%Y%m%d_%H%M}_{RUN_ID[:8]}"
-        latest_dir = f"{files_root}/model_health/latest"
+        latest_dir = f"{FILES_ROOT}/model_health/latest"
         os.makedirs(latest_dir, exist_ok=True)
         for old in os.listdir(latest_dir):  # never leave a previous run's files behind
             if old.endswith((".md", ".csv")):
                 os.remove(os.path.join(latest_dir, old))
         unused_out = outputs["unused_objects"]
         unused_out = unused_out[UNUSED_COLS] if len(unused_out) else pd.DataFrame(columns=UNUSED_COLS)
+
         def file_header(model_name):
             return (f"# Model health — {model_name}\nWorkspace: {WORKSPACE_NAME} · run `{RUN_ID}` · "
-                    f"{RUN_TS:%Y-%m-%d %H:%M} UTC · semantic-link-labs {_labs_version}\n\n")
-        payload = {"summary.md": summary}
-        payload.update({f"summary_{FILE_STEMS.get(ds, safe_name(ds))}.md": file_header(ds) + sec
-                        for ds, sec in sections.items()})
+                    f"{RUN_TS:%Y-%m-%d %H:%M} UTC · Model Health {NOTEBOOK_VERSION} · semantic-link-labs {_labs_version}\n\n")
+
+        text_files = {"summary.md": summary}
+        text_files.update({f"summary_{FILE_STEMS.get(ds, safe_name(ds))}.md": file_header(ds) + sec
+                           for ds, sec in sections.items()})
         for ds, d in dictionaries.items():
             parts = split_markdown(d)
             stem = FILE_STEMS.get(ds, safe_name(ds))
             for n, part in enumerate(parts, 1):
                 suffix = "" if len(parts) == 1 else f"_part{n}"
                 note = "" if len(parts) == 1 else f"_Part {n} of {len(parts)} of the data dictionary for {ds}._\n\n"
-                payload[f"dictionary_{stem}{suffix}.md"] = note + part
-        for folder in (latest_dir, f"{files_root}/model_health/runs/{stamp}"):
+                text_files[f"dictionary_{stem}{suffix}.md"] = note + part
+        csv_files = {"top_issues.csv": top_issues, "top_findings.csv": top_findings, "unused_candidates.csv": unused_out}
+        csv_files.update({f"doc_worklist_{FILE_STEMS.get(ds, safe_name(ds))}.csv": wl for ds, wl in worklists.items()})
+        for folder in (latest_dir, f"{FILES_ROOT}/model_health/runs/{stamp}"):
             os.makedirs(folder, exist_ok=True)
-            for fname, text in payload.items():
+            for fname, text in text_files.items():
                 with open(f"{folder}/{fname}", "w", encoding="utf-8") as fh:
                     fh.write(text)
-            top_issues.to_csv(f"{folder}/top_issues.csv", index=False)
-            top_findings.to_csv(f"{folder}/top_findings.csv", index=False)
-            unused_out.to_csv(f"{folder}/unused_candidates.csv", index=False)
-        written_files = sorted(payload) + ["top_issues.csv", "top_findings.csv", "unused_candidates.csv"]
-        print(f"Wrote {len(written_files)} files -> Files/model_health/latest/ (copy in runs/{stamp}/)")
-    else:
-        print("No default lakehouse mounted at /lakehouse/default; summary files skipped.")
+            for fname, frame in csv_files.items():
+                frame.to_csv(f"{folder}/{fname}", index=False)
+        _SAVED.add((RUN_ID, "files"))
+        print(f"Wrote {len(text_files) + len(csv_files)} files to Files/model_health/latest/ (copy in runs/{stamp}/)")
 
     table_errors = []
     for name, df in outputs.items():
-        if df.empty:
-            continue
         table_name = f"{TABLE_PREFIX}{name}"
+        if df.empty or (RUN_ID, table_name) in _SAVED:
+            continue
         try:
             labs.save_as_delta_table(dataframe=to_delta_safe(df), delta_table_name=table_name,
                                      write_mode="append", merge_schema=True)
+            _SAVED.add((RUN_ID, table_name))
             print(f"Appended {len(df):>6} rows -> {table_name}")
         except Exception as ex:
             table_errors.append(table_name)
             print(f"! Could not append to {table_name}: {type(ex).__name__}: {str(ex)[:200]}")
     if table_errors:
-        print(f"\n{len(table_errors)} table(s) failed. If they were created by an earlier notebook version, drop them "
-              f"or set TABLE_PREFIX to a new value (e.g. 'mh3_') and rerun. The summary files above are unaffected.")
+        print(f"\n{len(table_errors)} table(s) failed. Run this cell again to retry only those. If the tables were created "
+              f"by an older version of this notebook, drop them or set TABLE_PREFIX to a new value (for example 'mh2_') "
+              f"and run again. The summary files are unaffected.")
 
-# Copy-paste fallback: the agent summary, right here in the output
-print("\n" + "=" * 80 + "\nsummary.md (copy this into your agent if you can't upload files)\n" + "=" * 80)
+# %% [markdown]
+# ## Step 9 — Copy-paste summary
+# Only needed if you can't download `summary.md` from the lakehouse: this prints it as plain text to paste into your agent.
+
+# %%
 _cut = summary if len(summary) <= 12000 else summary[:max(summary.rfind("\n## ", 0, 12000), 2000)]
-print(_cut + ("\n\n…(truncated at a section boundary — full file in Files/model_health/latest/summary.md)"
+print(_cut + ("\n\n…(cut at a section boundary; the full text is in Files/model_health/latest/summary.md)"
               if len(_cut) < len(summary) else ""))
 
 # %% [markdown]
-# ## What to do with the results
+# ## What to do next
 #
-# - **Give the agent `Files/model_health/latest/summary.md`.** It holds the scorecard, then for up to 3 models (or the 2 worst): grouped priority issues, unused objects with confidence, model shape, documentation gaps and changes. For a deep dive on one model, add `summary_<model>.md` and `dictionary_<model>.md` (full DAX).
-# - The SQL endpoint can lag a few minutes behind new delta rows, so query the tables after a short wait.
-# - **Unused objects:** read `mh_usage_confidence` first.
+# - **Give your agent `Files/model_health/latest/summary.md`.** For one model in depth, add `summary_<model>.md` and `dictionary_<model>.md` (full DAX and Power Query).
+# - **Unused objects:** read the confidence level first.
 #   - Never delete straight from the list. Hiding an object stops *new* use, but existing visuals and Excel pivots keep working, so waiting for complaints proves nothing.
-#   - The safe sequence is: hide → check the query logs for 2–4 weeks (`MONITORING_DAYS`, needs workspace monitoring, 30-day retention) → back up the model → remove.
-#   - At **Low** or **Unknown** confidence, don't remove anything.
-#   - Respect `Used_Only_By_Unused`: remove those objects first.
-# - **Biggest wins first:** sort `mh_unused_objects` by `Size_Bytes`. For Direct Lake models, a size of 0 means "not loaded", not "small".
-# - **`mh_changes`** lists added, removed, renamed and changed objects. `Description_May_Be_Stale = True` means a measure's DAX changed but its description didn't. Update those descriptions first.
-# - **Backups before any removal:** save the model definition with `labs.get_semantic_model_bim(dataset=..., workspace=...)` (store the JSON in the lakehouse), or keep a .pbix / Git copy.
-# - **Trend:** every run appends a new Run Id, so a Power BI report on the `mh_` tables shows whether health is improving.
+#   - The safe sequence is: hide → check the query logs for 2–4 weeks (`MONITORING_DAYS`, needs workspace monitoring) → back up the model → remove.
+#   - At **Low** or **Unknown** confidence, remove nothing.
+#   - "After:" in a recommendation means those objects have to go first.
+#   - For Direct Lake models, a size of "n/a" means "not loaded in memory", not "small".
+# - **Documentation:** `doc_worklist_<model>.csv` lists what needs a description or comment, changed measures first. Have your agent fill the Draft columns from the dictionary file, then review them yourself. Nothing is written to the model.
+# - **Back up before any removal:** save the model definition with `labs.get_semantic_model_bim(dataset=..., workspace=...)` to the lakehouse, or keep a .pbix or Git copy.
+# - **Trend:** every run appends to the `mh_` tables under a new Run Id, so a Power BI report on them shows whether health is improving. The SQL endpoint can lag a few minutes behind new rows.

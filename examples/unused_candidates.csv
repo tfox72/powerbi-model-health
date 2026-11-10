@@ -1,0 +1,6 @@
+Dataset Name,Object Type,Table Name,Object Name,Is Hidden,Size Bytes,Size Note,Used Only By Unused,Confidence,Recommendation
+Sales Model,Column,Sales,Margin,False,0,,,Medium,Likely: check unread reports first; then hide → check logs → back up → remove.
+Sales Model,Column,_Measures,Column1,True,0,,,Medium,Likely: check unread reports first; then check logs → back up → remove.
+Sales Model,Measure,_Measures,Unused,True,0,,,Medium,Likely: check unread reports first; then check logs → back up → remove.
+Tiny,Column,Data,A,False,0,,,Low,Don't remove yet (confidence gap).
+Tiny,Column,Data,B,False,0,,,Low,Don't remove yet (confidence gap).

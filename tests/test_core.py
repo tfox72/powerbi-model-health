@@ -5,9 +5,15 @@ import json
 import re
 import pandas as pd
 
+import sys
+sys.path.insert(0, str(ROOT / "tools"))
+from build import split_cells
+
+# The Step 2 engine cells are pure Python (no Fabric calls): run them and test the functions directly.
 src = open(str(ROOT / "notebook" / "model_health_src.py"), encoding="utf-8").read()
-cells = re.split(r"^# %%.*$", src, flags=re.M)
-core = next(c for c in cells if "def has_comment" in c)
+step2 = src[src.index("# ## Step 2"):src.index("# ## Step 3")]
+core = "\n\n".join(body for kind, body in split_cells("# %% [markdown]\n" + step2) if kind == "engine")
+assert core.count("\ndef ") > 30, "engine cells not found"
 ns = {}
 exec(core, ns)
 _col, _meas, _anycol, _hier, _tbl, _anyhier = ns["_col"], ns["_meas"], ns["_anycol"], ns["_hier"], ns["_tbl"], ns["_anyhier"]
@@ -495,3 +501,62 @@ empty_cls = ns["classify_tables"](tables.head(0), rels.head(0))
 assert "Role" in empty_cls.columns and empty_cls.empty
 print("v5 additions ok")
 print("ALL CORE TESTS PASSED (v5)")
+
+# ---------------- v6 additions ----------------
+# select_models: case-insensitive names, default models only when named, skip list, missing names reported
+ALL = [{"name": "Sales Model", "id": "1", "is_default": False}, {"name": "LH1", "id": "2", "is_default": True},
+       {"name": "Finance", "id": "3", "is_default": False}]
+sel, missing, left = ns["select_models"](ALL, [], [])
+assert [m["name"] for m in sel] == ["Sales Model", "Finance"] and missing == [] and left == ["LH1"]
+sel, missing, left = ns["select_models"](ALL, ["sales model ", "Nope"], [])
+assert [m["name"] for m in sel] == ["Sales Model"] and missing == ["Nope"] and left == []
+sel, _, _ = ns["select_models"](ALL, ["LH1"], [])
+assert [m["name"] for m in sel] == ["LH1"]                         # a default model is scanned when named
+sel, _, _ = ns["select_models"](ALL, [], ["FINANCE"])
+assert [m["name"] for m in sel] == ["Sales Model"]
+assert ns["select_models"]([], ["X"], []) == ([], ["X"], [])
+assert ns["duplicate_names"]([{"name": "A"}, {"name": "B"}, {"name": "A"}]) == ["A"]
+
+# DMV: a plain COLUMN or TABLE source is an edge (used only if the source is used), never silently dropped
+e9, r9, _ = ns["build_dependency_edges"](pd.DataFrame([
+    {"Table Name": "T", "Object Name": "A", "Object Type": "COLUMN", "Referenced Table": "T", "Referenced Object": "B", "Referenced Object Type": "COLUMN"},
+    {"Table Name": "T", "Object Name": "", "Object Type": "TABLE", "Referenced Table": "U", "Referenced Object": "C", "Referenced Object Type": "COLUMN"},
+    {"Table Name": "CG", "Object Name": "YTD", "Object Type": "CALC_GROUP", "Referenced Table": "", "Referenced Object": "Base", "Referenced Object Type": "MEASURE"},
+]))
+assert _col("T", "B") in e9[_col("T", "A")] and _col("U", "C") in e9[_tbl("T")] and _meas("Base") in r9
+assert _col("T", "B") in ns["find_used_objects"]({_col("T", "A")}, e9, {}, {}, {}, {})
+assert _col("T", "B") not in ns["find_used_objects"](set(), e9, {}, {}, {}, {})
+
+# documentation worklist: changed-but-undescribed first, then measures (longest first), tables, M, columns
+inv9, find9 = ns["documentation_rows"](tables, columns, long_measure, exprs, skip_tables={"LocalDateTable_1", "Fields"},
+                                       long_chars=300, short_chars=80)
+find9 = pd.DataFrame(find9)
+chg9 = pd.DataFrame([["Expression changed", "Measure", "_Measures", "Total Sales", "", True],
+                     ["Added", "Measure", "_Measures", "Dead Top", "", False]],
+                    columns=["Change", "Object_Type", "Table_Name", "Object_Name", "Previous_Name", "Description_May_Be_Stale"])
+wl = ns["doc_worklist"](find9, inv9, chg9)
+assert list(wl.columns) == ns["WORKLIST_COLUMNS"]
+first = wl.iloc[0]
+assert first["Object Name"] == "Total Sales" and first["Needs"] == "review description (expression changed)"
+assert first["Current Description"] == "Sum of sales" and first["Lineage Tag"] == "lt-Total Sales"
+second = wl.iloc[1]
+assert second["Object Name"] == "Long One" and second["Needs"] == "description + comment"
+types = list(wl["Object Type"])
+assert types.index("Measure") < types.index("Table") < types.index("M Partition") < types.index("Column"), types
+assert (wl[["Draft Description", "Draft Comment", "Approved"]] == "").all().all()
+assert not wl.duplicated(["Object Type", "Table Name", "Object Name"]).any()
+assert ns["doc_worklist"](None, None, None).empty and ns["doc_worklist"](find9.head(0), inv9, None).empty
+
+# the summary points at the worklist, and the header names the notebook version
+sec9 = ns["model_summary_markdown"]("M", "OK", {}, pd.DataFrame(), {}, None, None, None, inv9, None,
+                                    worklist_file="doc_worklist_M.csv", worklist_count=len(wl))
+assert f"`doc_worklist_M.csv` ({len(wl)} objects)" in sec9
+ws9 = ns["workspace_summary_markdown"]({**meta_, "notebook_version": "0.6.0"}, scw, {}, pd.DataFrame())
+assert "Model Health 0.6.0" in ws9
+
+# show_markdown never raises, with or without IPython
+import io as _io, contextlib as _ctx
+with _ctx.redirect_stdout(_io.StringIO()) as _b:
+    ns["show_markdown"]("# hello")
+print("v6 additions ok")
+print("ALL CORE TESTS PASSED (v6)")

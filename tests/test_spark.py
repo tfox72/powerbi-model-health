@@ -44,7 +44,7 @@ for ts, ws, ds, name, h in [
     ("2026-11-02", "ws-1", "ds-2", "Other", "o1"),
     ("2026-11-05", "ws-9", "ds-1", "WrongWorkspace", "z"),
 ]:
-    rows.append({"Run_Timestamp": pd.Timestamp(ts), "Workspace_Id": ws, "Dataset_Id": ds, "Dataset_Name": "M",
+    rows.append({"Run_Id": f"run-{ts}", "Run_Timestamp": pd.Timestamp(ts), "Workspace_Id": ws, "Dataset_Id": ds, "Dataset_Name": "M",
                  "Object_Type": "Measure", "Table_Name": "_M", "Object_Name": name, "Lineage_Tag": f"lt-{name}",
                  "Expression_Hash": h, "Description": "", "Extra_Col": 1})
 spark.createDataFrame(pd.DataFrame(rows)).write.saveAsTable("mh_documentation")
@@ -54,7 +54,10 @@ assert set(prev["Expression_Hash"]) == {"h1", "m1"}
 assert "Extra_Col" not in prev.columns
 both = read_previous_docs("mh_documentation", "ws-1", ["ds-1", "ds-2"])
 assert set(both["Object_Name"]) == {"Total Sales", "Margin", "Other"}
-print("latest-snapshot filter ok")
+# The current run is excluded, so re-running after a save compares with the run before it, not with itself
+earlier = read_previous_docs("mh_documentation", "ws-1", ["ds-1"], exclude_run_id="run-2026-11-01")
+assert set(earlier["Expression_Hash"]) == {"h0"}, earlier
+print("latest-snapshot filter ok (current run excluded)")
 
 # 2. every output frame from a mocked notebook run converts to Spark and appends twice (schema stays stable)
 import importlib.util, io, contextlib

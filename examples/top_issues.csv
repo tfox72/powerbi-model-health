@@ -1,0 +1,10 @@
+Dataset Name,Severity,Area,Issue,Count,Examples,Fix
+Sales Model,Warning,Star schema,Table has no relationships and has visible columns.,1,Store,"If it is a slicer or parameter table, hide what users shouldn't pick and add a description; otherwise relate it to the model or remove it."
+Sales Model,Warning,BPA: Formatting,Provide format string for measures,1,Unused,Set a format string on each measure.
+Sales Model,Warning,BPA: Formatting,Do not summarize numeric columns,1,'Sales'[Amount],Set Summarize By = None on numeric key/attribute columns.
+Sales Model,Warning,Documentation,Visible measures without descriptions,1,Param Measure,"Add one sentence in business terms: what it means, plus grain or filter context if relevant."
+Sales Model,Info,Usage,"Unused objects (2 hidden, 1 visible)",3,"Sales[Margin], _Measures[Column1], _Measures[Unused]",Confidence Medium. See the unused-objects section; never delete straight from the list.
+Sales Model,Info,Documentation,Other documentation gaps,16,5 Tables without descriptions; 10 Columns without descriptions; 1 Calculated Column without a description,Lower priority: describe user-facing tables/columns; add header comments to Power Query steps.
+Tiny,Warning,Star schema,Table has no relationships and has visible columns.,1,Data,"If it is a slicer or parameter table, hide what users shouldn't pick and add a description; otherwise relate it to the model or remove it."
+Tiny,Info,Usage,"Unused objects (0 hidden, 2 visible)",2,"Data[A], Data[B]",Confidence Low. See the unused-objects section; never delete straight from the list.
+Tiny,Info,Documentation,Other documentation gaps,3,1 Table without a description; 2 Columns without descriptions,Lower priority: describe user-facing tables/columns; add header comments to Power Query steps.

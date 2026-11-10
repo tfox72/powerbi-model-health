@@ -166,6 +166,7 @@ labs.vertipaq_analyzer = lambda **kw: {"Columns": pd.DataFrame([
 SAVED = {}
 def _save(dataframe, delta_table_name, write_mode, merge_schema):
     assert write_mode == "append"
+    SAVE_CALLS.append(delta_table_name)
     SAVED[delta_table_name] = dataframe
 labs.save_as_delta_table = _save
 
@@ -257,20 +258,42 @@ shutil.rmtree(_pl.Path(FILES).parent, ignore_errors=True); os.makedirs(FILES)
 NB = json.load(open(str(ROOT / "notebook" / "Model_Health_Phase1.ipynb")))
 
 
-def run_notebook(params_override=""):
+SAVE_CALLS = []          # every save_as_delta_table call, to prove nothing is saved twice
+PREV_CALLS = []          # exclude_run_id values passed to read_previous_docs
+
+
+def _cell_code(c, params_override="", files_root=None):
+    code = "".join(c["source"]).replace('"/lakehouse/default/Files"', f'"{files_root or FILES}"')
+    if c["metadata"].get("tags") == ["parameters"]:
+        code += "\n" + params_override
+    return code
+
+
+def run_notebook(params_override="", files_root=None):
+    """Run every code cell in order (except %pip), the way Run all does."""
     SAVED.clear()
-    g = {"display": lambda x: None, "spark": object()}
+    g = {"spark": object()}
     for i, c in enumerate(NB["cells"]):
-        code = "".join(c["source"])
-        if c["cell_type"] != "code" or code.lstrip().startswith("%pip"):
+        if c["cell_type"] != "code" or "".join(c["source"]).lstrip().startswith("%pip"):
             continue
-        code = code.replace('"/lakehouse/default/Files"', f'"{FILES}"')
-        if c["metadata"].get("tags") == ["parameters"]:
-            code += "\n" + params_override
+        code = _cell_code(c, params_override, files_root)
         exec(compile(code, f"cell{i}", "exec"), g)
         if "def read_previous_docs" in code:
-            g["read_previous_docs"] = lambda table, ws, ids: PREV.copy()
+            def _prev(table, ws, ids, exclude_run_id=None):
+                PREV_CALLS.append(exclude_run_id)
+                return PREV.copy()
+            g["read_previous_docs"] = _prev
     return g
+
+
+def rerun_cells(g, heading):
+    """Re-run the code cell that follows the markdown cell starting with `heading`, in the same session."""
+    for i, c in enumerate(NB["cells"]):
+        if c["cell_type"] == "markdown" and "".join(c["source"]).startswith(heading):
+            code = _cell_code(NB["cells"][i + 1])
+            exec(compile(code, f"cell{i + 1}", "exec"), g)
+            return
+    raise AssertionError(f"no cell under {heading!r}")
 
 
 import io, contextlib
@@ -322,7 +345,11 @@ latest = f"{FILES}/model_health/latest"
 files1 = sorted(os.listdir(latest))
 assert files1 == sorted(["summary.md", "summary_Sales_Model.md", "summary_Broken.md", "summary_Tiny.md",
                          "dictionary_Sales_Model.md", "dictionary_Tiny.md",
+                         "doc_worklist_Sales_Model.csv", "doc_worklist_Tiny.csv",
                          "top_issues.csv", "top_findings.csv", "unused_candidates.csv"]), files1
+_wl = pd.read_csv(f"{latest}/doc_worklist_Sales_Model.csv", keep_default_na=False)
+assert _wl.iloc[0]["Object Name"] == "Total Sales" and _wl.iloc[0]["Needs"].startswith("review description")
+assert "`doc_worklist_Sales_Model.csv`" in open(f"{latest}/summary_Sales_Model.md").read()
 _c = SAVED["mh_usage_confidence"]; tiny_conf = _c[_c["Dataset_Name"] == "Tiny"]
 assert tiny_conf["Confidence"].iloc[0] == "Low"                       # zero-measure model analysed, no reports
 assert "Unused objects — not run" not in open(f"{latest}/summary_Tiny.md").read()
@@ -337,7 +364,23 @@ assert "BPA not run" not in _tiny and "Provide format string" not in _tiny
 summary = open(f"{latest}/summary.md").read()
 assert "| Broken | FAILED at Read model metadata" in summary, summary[:600]
 assert "### Priority issues" in summary and "Reports not read: Locked Report" in summary and "### Model shape" in summary
-assert "summary.md (copy this into your agent" in out1
+assert "Preflight passed." in out1 and "[ok]   Lakehouse attached" in out1
+assert "[ok]   Model metadata readable ('Sales Model', 7 tables)" in out1
+assert "Default lakehouse/warehouse models left out: ['LH1']" in out1
+assert out1.count("# Model health summary — Finance WS") == 2          # Step 7 (rendered) and Step 9 (copy-paste)
+assert "Model Health 0.6.0" in summary
+assert PREV_CALLS[-1] == g["RUN_ID"]                                    # change tracking never compares a run with itself
+
+# Re-running cells in the same session must not duplicate anything
+n_saves = len(SAVE_CALLS)
+with contextlib.redirect_stdout(io.StringIO()) as _b:
+    rerun_cells(g, "## Step 8")
+assert len(SAVE_CALLS) == n_saves and "already saved" in _b.getvalue()
+_old_run = g["RUN_ID"]
+with contextlib.redirect_stdout(io.StringIO()):
+    rerun_cells(g, "## Step 5"); rerun_cells(g, "## Step 6"); rerun_cells(g, "## Step 8")
+assert g["RUN_ID"] != _old_run and len(SAVE_CALLS) == 2 * n_saves          # a new scan is a new run and is saved once
+assert set(SAVED["mh_findings"]["Run_Id"]) == {g["RUN_ID"]}
 dic = open(f"{latest}/dictionary_Sales_Model.md").read()
 assert "### [Total Sales]" in dic and "SUM(Sales[Amount])" in dic and "LocalDateTable_abc" not in dic
 print("RUN 1 (normal) PASSED")
@@ -348,9 +391,11 @@ print("-" * 80)
 # ---------------- run 2: every model fails + one table write fails ----------------
 _orig_connect, _orig_save = tom_mod.connect_semantic_model, labs.save_as_delta_table
 tom_mod.connect_semantic_model = lambda dataset, workspace=None, readonly=True: (_ for _ in ()).throw(RuntimeError("XMLA disabled"))
+FLAKY = {"on": True}
 def flaky_save(dataframe, delta_table_name, write_mode, merge_schema):
-    if delta_table_name == "mh_run_log":
+    if delta_table_name == "mh_run_log" and FLAKY["on"]:
         raise RuntimeError("Failed to merge fields 'Seconds' and 'Seconds'")
+    SAVE_CALLS.append(delta_table_name)
     SAVED[delta_table_name] = dataframe
 labs.save_as_delta_table = flaky_save
 buf = io.StringIO()
@@ -365,18 +410,47 @@ assert lines[0].startswith("Dataset Name,Object Type") and len(lines) == 1      
 s2 = open(f"{latest}/summary.md").read()
 assert s2.count("FAILED at Read model metadata") >= 2 and "Steps that failed" in s2, s2
 assert "Could not append to mh_run_log" in out2 and "set TABLE_PREFIX" in out2
-print("RUN 2 (all models fail, one table write fails) PASSED")
+assert "[warn] Could not open 'Sales Model'" in out2 and "XMLA endpoints" in out2    # preflight warns, scan still runs
+FLAKY["on"] = False                                                      # retry: only the failed table is written
+n_saves = len(SAVE_CALLS)
+with contextlib.redirect_stdout(io.StringIO()):
+    rerun_cells(g2, "## Step 8")
+assert SAVE_CALLS[n_saves:] == ["mh_run_log"], SAVE_CALLS[n_saves:]
+print("RUN 2 (all models fail, one table write fails, retry) PASSED")
 tom_mod.connect_semantic_model, labs.save_as_delta_table = _orig_connect, _orig_save
 
-# ---------------- run 3: no models match ----------------
+# ---------------- run 3: preflight stops early with a plain message ----------------
+def expect_stop(exc_type, needles, **kw):
+    n_saves = len(SAVE_CALLS)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            run_notebook(**kw)
+    except exc_type as ex:
+        assert all(n in str(ex) for n in needles), str(ex)
+        assert len(SAVE_CALLS) == n_saves                                # nothing was scanned or saved
+        return
+    raise AssertionError(f"preflight did not stop for {kw}")
+
+expect_stop(ValueError, ["Not found: ['Does Not Exist']", "Sales Model", "Fix DATASETS"], params_override='DATASETS = "Does Not Exist"')
+expect_stop(RuntimeError, ["No lakehouse is attached", "WRITE_TO_LAKEHOUSE = False"], files_root="/nonexistent/Files")
+_orig_list = fabric.list_datasets
+fabric.list_datasets = lambda workspace=None, mode=None: pd.DataFrame({"Dataset Name": [], "Dataset Id": []})
+expect_stop(ValueError, ["No semantic models were found in workspace 'Finance WS'"])
+fabric.list_datasets = _orig_list
+# a partly wrong list warns and carries on; names match case-insensitively
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    g3 = run_notebook('DATASETS = "Does Not Exist"')
-s3 = open(f"{latest}/summary.md").read()
-assert "No models were analyzed" in s3, s3[:300]
-assert "Not found in Finance WS: ['Does Not Exist']" in buf.getvalue()
-assert sorted(os.listdir(latest)) == ["summary.md", "top_findings.csv", "top_issues.csv", "unused_candidates.csv"]
-print("RUN 3 (no models) PASSED")
+    g3 = run_notebook('DATASETS = "sales model, Nope"')
+assert [m["name"] for m in g3["models"]] == ["Sales Model"] and "[warn] Not found in 'Finance WS' and skipped: ['Nope']" in buf.getvalue()
+print("RUN 3 (preflight stops and warnings) PASSED")
+
+# ---------------- run 3b: no lakehouse, notebook-only results ----------------
+n_saves = len(SAVE_CALLS)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    run_notebook("WRITE_TO_LAKEHOUSE = False", files_root="/nonexistent/Files")
+assert len(SAVE_CALLS) == n_saves and "nothing was saved" in buf.getvalue() and "### Priority issues" in buf.getvalue()
+print("RUN 3b (WRITE_TO_LAKEHOUSE = False) PASSED")
 
 # ---------------- run 4: query-log check on ----------------
 with contextlib.redirect_stdout(io.StringIO()):
@@ -423,7 +497,7 @@ print("RUNTIME CHECK PASSED")
 import re as _re
 with contextlib.redirect_stdout(io.StringIO()):
     run_notebook()
-doc = open(str(ROOT / "skill" / "references" / "output-tables.md")).read()
+doc = open(str(ROOT / "skills" / "powerbi-model-health" / "references" / "output-tables.md")).read()
 for t, df in SAVED.items():
     rows = [l for l in doc.splitlines() if l.startswith(f"| `{t}`")]
     assert rows, f"{t} not documented"

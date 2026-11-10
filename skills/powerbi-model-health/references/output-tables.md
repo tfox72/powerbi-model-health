@@ -2,15 +2,14 @@
 
 ## Files (for agents and people)
 
-These are written to `Files/model_health/latest/`, overwritten each run, with a dated copy kept under `Files/model_health/runs/<date>_<runid>/`.
-
-Old files in `latest/` are deleted at the start of each run, so nothing stale is left behind.
+These are written to `Files/model_health/latest/` and replaced on every run, with a dated copy kept under `Files/model_health/runs/<date>_<runid>/`. Old files in `latest/` are deleted first, so nothing stale is left behind.
 
 | File | Contents |
 |---|---|
-| `summary.md` | Scorecard for every model (Status, Errors, Key Warnings, which excludes formatting and docs, and so on), plus full sections for up to 3 models, or the 2 with the most errors and key warnings, and the failed steps. Also printed at the end of the notebook. |
+| `summary.md` | Scorecard for every model (Status, Errors, Key Warnings, which excludes formatting and docs, and so on), plus full sections for up to 3 models, or the 2 with the most errors and key warnings, and the failed steps. The notebook also shows it in Step 7 and prints it in Step 9. |
 | `summary_<model>.md` | One model's sections, in this order: grouped Priority issues, unused objects with confidence and unread reports, model shape, documentation gaps (longest measures first), changes (stale first, Added as a count only). |
 | `dictionary_<model>.md` | All relationships (direction, cardinality, cross-filter, active). Every table and column with its description. Every measure, calculated column, calculated table and calculation item with its full DAX. Every Power Query partition, incremental-refresh source and shared expression/parameter with its M. Auto-date tables are left out, and code over 4,000 characters is truncated. Files over ~150,000 characters are split into `_part1`, `_part2`… at table boundaries. Only written for models that could be read. |
+| `doc_worklist_<model>.csv` | One row per object that needs a description or comment, in priority order: objects whose expression changed while the description didn't, then measures (longest first), calculated columns, tables, other expressions and columns. `Draft Description`, `Draft Comment` and `Approved` are blank for the agent and the owner to fill. `Lineage Tag` identifies the object even after a rename. Only written when something needs documenting. |
 | `top_issues.csv` | Grouped issues for every model. One row per issue type, with Count, Examples and Fix. |
 | `top_findings.csv` | Up to `TOP_FINDINGS_PER_MODEL` individual findings per model, ranked by severity, then area. |
 | `unused_candidates.csv` | Every unused candidate (header-only when there are none). |
@@ -25,11 +24,13 @@ Old files in `latest/` are deleted at the start of each run, so nothing stale is
 7. Maintenance, plus the noisy Performance rules (floating point, IsAvailableInMdx, partitioning, calculated columns, RLS)
 8. Formatting
 9. Naming
-10. Documentation Measure documentation gets its own rows; every other documentation gap is folded into one "Other documentation gaps" row.
+10. Documentation
+
+Measure documentation gets its own rows; every other documentation gap is folded into one "Other documentation gaps" row.
 
 ## Delta tables
 
-Every table starts with `Run_Id`, `Run_Timestamp`, `Workspace_Name`, `Workspace_Id`, `Dataset_Name` and `Dataset_Id`. Runs **append**, so take each model's latest run by joining on `Dataset_Id` and the max `Run_Timestamp` in `mh_run_log`. Joining on IDs survives renames.
+Every table starts with `Run_Id`, `Run_Timestamp`, `Workspace_Name`, `Workspace_Id`, `Dataset_Name` and `Dataset_Id`. Runs **append**, so take each model's latest run by joining on `Dataset_Id` and the max `Run_Timestamp` in `mh_run_log`. Joining on IDs survives renames. Each scan (Step 5) is one run; saving the same run twice writes nothing twice.
 
 | Table | One row per | Key columns |
 |---|---|---|
@@ -38,7 +39,7 @@ Every table starts with `Run_Id`, `Run_Timestamp`, `Workspace_Name`, `Workspace_
 | `mh_usage_confidence` | model | `Confidence`, `Confidence_Detail`, `Query_Logs` (Checked N days / Partial: reason / Not checked / Failed), `Reports_Found`, `Reports_Scanned`, `Other_Dependent_Items`, `Excluded_Tables`, `DMV_Object_Types` |
 | `mh_star_schema_tables` | table | `Role`, `Many_side_Relationships`, `One_side_Relationships`, `Many_to_many_Relationships`, `Visible_Columns`, `Measures`, `Is_Date_Table`, `Storage_Mode` |
 | `mh_relationships` | relationship | `From_Table`, `From_Column`, `To_Table`, `To_Column`, `From_Cardinality`, `To_Cardinality`, `Cross_Filter`, `Is_Active` |
-| `mh_documentation` | table, column, measure or expression | `Object_Type`, `Has_Description`, `Has_Expression`, `Has_Comment`, `Expression_Length`, `Expression_Hash`, `Lineage_Tag`, `Description` |
+| `mh_documentation` | table, column, measure or expression | `Object_Type`, `Has_Description`, `Has_Expression`, `Has_Comment`, `Expression_Length`, `Expression_Hash`, `Lineage_Tag`, `Description`, `Is_Generated` (auto-date and field-parameter tables: listed but never flagged or counted in coverage) |
 | `mh_changes` | change since the previous run | `Change` (Added / Removed / Renamed / Expression changed / Description changed), `Object_Type`, `Table_Name`, `Object_Name`, `Previous_Name`, `Description_May_Be_Stale` |
 | `mh_column_sizes` | largest columns | `Table_Name`, `Column_Name`, `Cardinality`, `Total_Size` |
 | `mh_report_scan` | report bound to the model | `Report_Name`, `Report_Id`, `Report_Workspace_Id`, `Format` (PBIR / PBIR-Legacy), `Scanned`, `Fields_Found`, `Error` |
